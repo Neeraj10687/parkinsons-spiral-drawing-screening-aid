@@ -1,33 +1,21 @@
 """
-Training script for the handcrafted-features baseline.
+Training script for both the handcrafted-features baseline AND the CNN.
 
-Trains a logistic regression on the 5 handcrafted features using patient-level
-5-fold StratifiedGroupKFold cross-validation. Reports per-fold and pooled
-out-of-fold (OOF) accuracy with mean ± std.
-
-This is the FIRST honest accuracy number of the project. Expected: 70-80%.
-
-Why logistic regression?
-    - Simple, interpretable, fast
-    - Standard baseline for binary classification
-    - Won't overfit on small feature sets (5 features, 264 samples)
-    - The literature predicts handcrafted features may match the CNN on
-      sparse spiral data — if LR gets ~75% and CNN gets ~82%, the McNemar
-      test will tell us if that difference is significant
-
-Methodology:
-    Patient-level CV means each patient's drawings go entirely into either
-    training or testing, never both. This prevents the data leakage that
-    inflates accuracy by 30-55 percentage points per PMC 2021 (PMC8604922).
+Trains a logistic regression on the 5 handcrafted features, AND a 3-block
+CNN with oversampled balanced data, both using patient-level 5-fold
+StratifiedGroupKFold cross-validation. Reports per-fold and pooled
+out-of-fold (OOF) accuracy.
 
 Usage:
-    python src/train.py
+    python src/train.py --model baseline    # LR only
+    python src/train.py --model cnn         # CNN only
+    python src/train.py --model both        # both (default)
 
 Outputs:
-    - Per-fold accuracy, precision, recall, F1
-    - Pooled OOF accuracy ± std
-    - Saved OOF predictions at data/processed/oof_predictions_handcrafted.npy
-      (used later for McNemar test against the CNN)
+    - data/processed/oof_predictions_handcrafted.npy
+    - data/processed/oof_predictions_cnn.npy
+    - data/processed/oof_probabilities_cnn.npy
+    (used for McNemar test in src/evaluate.py)
 """
 
 import os
@@ -42,6 +30,7 @@ from sklearn.metrics import (
     f1_score,
     confusion_matrix,
 )
+from sklearn.utils import resample
 
 # Add project root to path
 sys.path.insert(0, os.path.abspath("."))
@@ -50,100 +39,228 @@ from src.data_loader import (
     load_newhandpd,
     patient_level_split,
     verify_no_patient_overlap,
+    load_features,
 )
 
 
-# ---------------------------------------------------------------------------
-# Step 1: Load features (saved by src/features.py)
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# PART 1: HANDCRAFTED BASELINE (Logistic Regression)
+# ===========================================================================
 
-def load_features():
-    """Load the handcrafted features saved by src/features.py.
-
-    Returns:
-        feature_matrix: np.array of shape (264, 5) — features for each image
-        feature_names: list of 5 feature name strings
-    """
-    features_path = "data/processed/features_handcrafted.npy"
-    names_path = "data/processed/feature_names.npy"
-
-    if not os.path.exists(features_path):
-        raise FileNotFoundError(
-            f"Features not found at {features_path}. "
-            "Run `python src/features.py` first to generate them."
-        )
-
-    feature_matrix = np.load(features_path)
-    feature_names = np.load(names_path, allow_pickle=True).tolist()
-
-    print(f"Loaded features: {feature_matrix.shape}")
-    print(f"Feature names: {feature_names}")
-    return feature_matrix, feature_names
-
-
-# ---------------------------------------------------------------------------
-# Step 2: Train one fold of logistic regression
-# ---------------------------------------------------------------------------
-
-def train_one_fold(X_train, y_train, X_test, y_test, fold_idx):
-    """Train logistic regression on one fold and return predictions + metrics.
-
-    Includes feature standardization (z-score normalization) — critical for
-    logistic regression because features have very different scales:
-        - intersection_count: 0-300
-        - stroke_entropy: 0.97-0.99
-        - mean_squared_displacement: 0.12-0.15
-
-    Without standardization, the feature with the largest scale dominates.
+def train_handcrafted_baseline(features, labels, patient_ids, n_splits=5):
+    """Train LR baseline with patient-level 5-fold CV.
 
     Args:
-        X_train: training features, shape (n_train, 5)
-        y_train: training labels, shape (n_train,)
-        X_test: test features, shape (n_test, 5)
-        y_test: test labels, shape (n_test,)
-        fold_idx: which fold (for printing)
+        features: numpy array (632, 5)
+        labels: numpy array (632,)
+        patient_ids: numpy array (632,)
+        n_splits: number of CV folds
 
     Returns:
-        dict with:
-            - predictions: binary predictions for test set
-            - probabilities: predicted probabilities for test set
-            - accuracy, precision, recall, f1: scalars
-            - confusion_matrix: 2x2 array
+        dict with OOF predictions, fold metrics, pooled metrics
     """
-    # Standardize features: zero mean, unit variance
-    # Fit on TRAINING data only, then transform both train and test
-    # (Critical: fitting on test data would be leakage)
+    print(f"\nRunning LR baseline {n_splits}-fold patient-level CV...")
+
+    splits = patient_level_split(features, labels, patient_ids,
+                                 n_splits=n_splits, random_state=42)
+
+    oof_predictions = np.zeros(len(labels), dtype=int)
+    oof_test_mask = np.zeros(len(labels), dtype=bool)
+    fold_metrics = []
+
+    for fold_idx, (train_idx, test_idx) in enumerate(splits):
+        verify_no_patient_overlap(patient_ids, train_idx, test_idx)
+
+        X_train, X_test = features[train_idx], features[test_idx]
+        y_train, y_test = labels[train_idx], labels[test_idx]
+
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train)
+        X_test_scaled = scaler.transform(X_test)
+
+        model = LogisticRegression(class_weight="balanced", max_iter=1000, random_state=42)
+        model.fit(X_train_scaled, y_train)
+
+        predictions = model.predict(X_test_scaled)
+        accuracy = accuracy_score(y_test, predictions)
+        precision = precision_score(y_test, predictions, zero_division=0)
+        recall = recall_score(y_test, predictions, zero_division=0)
+        f1 = f1_score(y_test, predictions, zero_division=0)
+        cm = confusion_matrix(y_test, predictions)
+
+        print(f"  Fold {fold_idx + 1}: acc={accuracy:.4f}, prec={precision:.4f}, "
+              f"rec={recall:.4f}, f1={f1:.4f}")
+
+        oof_predictions[test_idx] = predictions
+        oof_test_mask[test_idx] = True
+        fold_metrics.append({
+            "fold": fold_idx + 1, "accuracy": accuracy, "precision": precision,
+            "recall": recall, "f1": f1, "confusion_matrix": cm,
+        })
+
+    assert oof_test_mask.all(), "Some images were never predicted"
+
+    pooled_accuracy = accuracy_score(labels, oof_predictions)
+    pooled_precision = precision_score(labels, oof_predictions, zero_division=0)
+    pooled_recall = recall_score(labels, oof_predictions, zero_division=0)
+    pooled_f1 = f1_score(labels, oof_predictions, zero_division=0)
+    pooled_cm = confusion_matrix(labels, oof_predictions)
+
+    fold_accuracies = [m["accuracy"] for m in fold_metrics]
+    mean_acc = np.mean(fold_accuracies)
+    std_acc = np.std(fold_accuracies)
+
+    return {
+        "oof_predictions": oof_predictions,
+        "fold_metrics": fold_metrics,
+        "mean_accuracy": mean_acc,
+        "std_accuracy": std_acc,
+        "pooled_accuracy": pooled_accuracy,
+        "pooled_precision": pooled_precision,
+        "pooled_recall": pooled_recall,
+        "pooled_f1": pooled_f1,
+        "pooled_confusion_matrix": pooled_cm,
+    }
+
+
+def print_results(results, feature_names):
+    """Print baseline results."""
+    print("\n" + "=" * 70)
+    print("HANDCRAFTED BASELINE RESULTS — Patient-Level 5-Fold CV")
+    print("=" * 70)
+
+    print(f"\n--- Per-Fold Results ---")
+    print(f"{'Fold':<6} {'Accuracy':<12} {'Precision':<12} {'Recall':<12} {'F1':<12}")
+    print("-" * 60)
+    for m in results["fold_metrics"]:
+        print(f"{m['fold']:<6} {m['accuracy']:<12.4f} {m['precision']:<12.4f} "
+              f"{m['recall']:<12.4f} {m['f1']:<12.4f}")
+
+    print(f"\n--- Summary ---")
+    print(f"Mean accuracy:  {results['mean_accuracy']:.4f} ± {results['std_accuracy']:.4f}")
+    print(f"Pooled OOF acc: {results['pooled_accuracy']:.4f}")
+    print(f"Pooled recall:  {results['pooled_recall']:.4f}")
+    print(f"Pooled F1:      {results['pooled_f1']:.4f}")
+
+
+def save_predictions(results):
+    """Save OOF predictions for McNemar test."""
+    os.makedirs("data/processed", exist_ok=True)
+    np.save("data/processed/oof_predictions_handcrafted.npy", results["oof_predictions"])
+    print(f"  Saved to data/processed/oof_predictions_handcrafted.npy")
+
+
+def analyze_feature_importance(features, labels, patient_ids, feature_names):
+    """Analyze which features matter most using LR coefficients."""
     scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
-    X_test_scaled = scaler.transform(X_test)
+    features_scaled = scaler.fit_transform(features)
 
-    # Train logistic regression
-    # - class_weight='balanced': automatically weight minority class higher
-    #   (our dataset is ~53/47, so this has minor effect, but it's good practice)
-    # - max_iter=1000: increase from default 100 to ensure convergence
-    # - random_state=42: reproducibility
-    model = LogisticRegression(
-        class_weight="balanced",
-        max_iter=1000,
-        random_state=42,
+    model = LogisticRegression(class_weight="balanced", max_iter=1000, random_state=42)
+    model.fit(features_scaled, labels)
+
+    print(f"\n--- Feature Importance (LR coefficients) ---")
+    coefs = model.coef_[0]
+    ranked = sorted(zip(feature_names, coefs), key=lambda x: abs(x[1]), reverse=True)
+    for i, (name, coef) in enumerate(ranked):
+        print(f"  {i + 1}. {name:<30} {coef:+.4f}")
+
+
+# ===========================================================================
+# PART 2: CNN TRAINING (v4 — oversampling, no BatchNorm)
+# ===========================================================================
+
+def train_cnn_one_fold(X_train, y_train, X_test, y_test, fold_idx,
+                       epochs=60, batch_size=16, learning_rate=1e-4):
+    """Train the CNN on one fold with oversampled balanced data.
+
+    v4 design (working — no collapse):
+        - Oversample healthy class to match PD count (50/50 training)
+        - NO BatchNorm (destabilized training on small batches)
+        - NO augmentation (adds noise when model is already struggling)
+        - NO L2 regularization (over-constrained the model)
+        - NO class_weight (backfired — amplified collapse)
+        - Fresh model per fold
+
+    Previous versions (v1-v3) all collapsed to "predict all PD" because:
+        1. Class imbalance (420 PD vs 212 healthy) — shortcut to 66% accuracy
+        2. BatchNorm noise on small batches pushed toward collapse
+        3. Class weighting amplified the collapse
+
+    Args:
+        X_train: training images, shape (n_train, 256, 256, 1)
+        y_train: training labels, shape (n_train,)
+        X_test: test images, shape (n_test, 256, 256, 1)
+        y_test: test labels, shape (n_test,)
+        fold_idx: which fold (for printing)
+        epochs: number of epochs (default 60)
+        batch_size: training batch size (default 16)
+        learning_rate: Adam learning rate (default 1e-4)
+
+    Returns:
+        dict with predictions, probabilities, metrics, history
+    """
+    import tensorflow as tf
+    from src.model import build_model
+
+    # 1. OVERSAMPLE healthy class to match PD count
+    pd_idx = np.where(y_train == 1)[0]
+    healthy_idx = np.where(y_train == 0)[0]
+    n_pd = len(pd_idx)
+
+    healthy_upsampled = resample(healthy_idx, n_samples=n_pd,
+                                 random_state=42, replace=True)
+    balanced_idx = np.concatenate([pd_idx, healthy_upsampled])
+
+    X_train_bal = X_train[balanced_idx]
+    y_train_bal = y_train[balanced_idx]
+
+    # Shuffle
+    shuffle_idx = np.random.permutation(len(balanced_idx))
+    X_train_bal = X_train_bal[shuffle_idx]
+    y_train_bal = y_train_bal[shuffle_idx]
+
+    print(f"  Fold {fold_idx} balanced: PD={n_pd}, Healthy={n_pd} (oversampled)")
+
+    # 2. Build fresh model (v4 — no BatchNorm, no L2)
+    model = build_model(learning_rate=learning_rate)
+
+    # 3. Train (NO class_weight — oversampling handles balance)
+    print(f"  Training fold {fold_idx} (epochs={epochs}, batch_size={batch_size})...")
+    history = model.fit(
+        X_train_bal, y_train_bal,
+        validation_split=0.15,
+        epochs=epochs,
+        batch_size=batch_size,
+        verbose=0,
     )
-    model.fit(X_train_scaled, y_train)
 
-    # Predict on test set
-    predictions = model.predict(X_test_scaled)
-    probabilities = model.predict_proba(X_test_scaled)[:, 1]  # P(class=1)
+    # 4. Predict on ORIGINAL test set (never oversampled)
+    probabilities = model.predict(X_test, verbose=0).flatten()
+    predictions = (probabilities >= 0.5).astype(int)
 
-    # Compute metrics
+    # 5. Metrics
     accuracy = accuracy_score(y_test, predictions)
     precision = precision_score(y_test, predictions, zero_division=0)
     recall = recall_score(y_test, predictions, zero_division=0)
     f1 = f1_score(y_test, predictions, zero_division=0)
     cm = confusion_matrix(y_test, predictions)
 
-    print(f"  Fold {fold_idx}: "
-          f"acc={accuracy:.4f}, prec={precision:.4f}, "
+    final_train_acc = history.history["accuracy"][-1]
+    final_val_acc = history.history["val_accuracy"][-1]
+
+    # Collapse check
+    if recall == 1.0 and cm[0, 0] == 0:
+        print(f"  WARNING: Model collapsed (predicting all PD)")
+    else:
+        print(f"  LEARNING: TN={cm[0,0]} healthy correctly identified")
+
+    print(f"  Fold {fold_idx}: acc={accuracy:.4f}, prec={precision:.4f}, "
           f"rec={recall:.4f}, f1={f1:.4f}")
-    print(f"           Confusion: TN={cm[0,0]} FP={cm[0,1]} FN={cm[1,0]} TP={cm[1,1]}")
+    print(f"  Train acc={final_train_acc:.3f}, Val acc={final_val_acc:.3f}")
+    print(f"  Confusion: TN={cm[0,0]} FP={cm[0,1]} FN={cm[1,0]} TP={cm[1,1]}")
+
+    del model
+    tf.keras.backend.clear_session()
 
     return {
         "predictions": predictions,
@@ -153,65 +270,48 @@ def train_one_fold(X_train, y_train, X_test, y_test, fold_idx):
         "recall": recall,
         "f1": f1,
         "confusion_matrix": cm,
-        "model": model,
-        "scaler": scaler,
+        "history": history.history,
     }
 
 
-# ---------------------------------------------------------------------------
-# Step 3: Full 5-fold patient-level CV
-# ---------------------------------------------------------------------------
+def train_cnn_with_cv(images, labels, patient_ids, n_splits=5, epochs=60, batch_size=16):
+    """Train CNN with patient-level 5-fold CV + oversampling.
 
-def train_handcrafted_baseline(features, labels, patient_ids, n_splits=5, random_state=42):
-    """Train logistic regression with patient-level 5-fold CV.
-
-    This is the MAIN function. It:
-        1. Creates the 5-fold patient-level split
-        2. For each fold: trains LR, predicts on test, collects OOF predictions
-        3. Pools all OOF predictions to compute overall accuracy
-        4. Reports mean ± std across folds
+    Same protocol as baseline, but with oversampled balanced training data
+    and the v4 CNN model (no BatchNorm).
 
     Args:
-        features: np.array of shape (264, 5)
-        labels: np.array of shape (264,)
-        patient_ids: np.array of shape (264,)
-        n_splits: number of CV folds (default 5)
-        random_state: for reproducibility
+        images: numpy array (632, 256, 256, 1)
+        labels: numpy array (632,)
+        patient_ids: numpy array (632,)
+        n_splits: number of CV folds
+        epochs: epochs per fold
+        batch_size: training batch size
 
     Returns:
-        dict with:
-            - oof_predictions: pooled predictions for ALL images (264,)
-            - oof_probabilities: pooled probabilities for ALL images (264,)
-            - fold_metrics: list of per-fold metric dicts
-            - mean_accuracy, std_accuracy: scalars
-            - pooled_accuracy: scalar (computed on pooled OOF)
+        dict with OOF predictions, fold metrics, pooled metrics
     """
-    print(f"\nRunning {n_splits}-fold patient-level cross-validation...")
+    print(f"\nRunning CNN v4 {n_splits}-fold patient-level CV with oversampling...")
 
-    # Get the 5-fold splits
-    splits = patient_level_split(features, labels, patient_ids,
-                                 n_splits=n_splits, random_state=random_state)
+    splits = patient_level_split(images, labels, patient_ids,
+                                 n_splits=n_splits, random_state=42)
 
-    # Storage for OOF predictions
-    # Each image will be predicted exactly once (when it's in the test fold)
     oof_predictions = np.zeros(len(labels), dtype=int)
     oof_probabilities = np.zeros(len(labels), dtype=float)
-    oof_test_mask = np.zeros(len(labels), dtype=bool)  # track which images we've predicted
-
+    oof_test_mask = np.zeros(len(labels), dtype=bool)
     fold_metrics = []
 
     for fold_idx, (train_idx, test_idx) in enumerate(splits):
-        # Verify no patient overlap (defensive — should never fail)
         verify_no_patient_overlap(patient_ids, train_idx, test_idx)
 
-        # Split data
-        X_train, X_test = features[train_idx], features[test_idx]
+        X_train, X_test = images[train_idx], images[test_idx]
         y_train, y_test = labels[train_idx], labels[test_idx]
 
-        # Train and predict
-        result = train_one_fold(X_train, y_train, X_test, y_test, fold_idx + 1)
+        result = train_cnn_one_fold(
+            X_train, y_train, X_test, y_test, fold_idx + 1,
+            epochs=epochs, batch_size=batch_size,
+        )
 
-        # Store OOF predictions
         oof_predictions[test_idx] = result["predictions"]
         oof_probabilities[test_idx] = result["probabilities"]
         oof_test_mask[test_idx] = True
@@ -227,18 +327,14 @@ def train_handcrafted_baseline(features, labels, patient_ids, n_splits=5, random
             "n_test": len(test_idx),
         })
 
-    # Verify all images were predicted exactly once
-    assert oof_test_mask.all(), "Some images were never predicted — check the splits"
-    assert oof_test_mask.sum() == len(labels), "Some images predicted more than once"
+    assert oof_test_mask.all(), "Some images were never predicted"
 
-    # Compute pooled accuracy (on all OOF predictions together)
     pooled_accuracy = accuracy_score(labels, oof_predictions)
     pooled_precision = precision_score(labels, oof_predictions, zero_division=0)
     pooled_recall = recall_score(labels, oof_predictions, zero_division=0)
     pooled_f1 = f1_score(labels, oof_predictions, zero_division=0)
     pooled_cm = confusion_matrix(labels, oof_predictions)
 
-    # Compute mean ± std across folds
     fold_accuracies = [m["accuracy"] for m in fold_metrics]
     mean_acc = np.mean(fold_accuracies)
     std_acc = np.std(fold_accuracies)
@@ -257,163 +353,112 @@ def train_handcrafted_baseline(features, labels, patient_ids, n_splits=5, random
     }
 
 
-# ---------------------------------------------------------------------------
-# Step 4: Print results nicely
-# ---------------------------------------------------------------------------
-
-def print_results(results, feature_names):
-    """Print the results in a clear, report-ready format.
-
-    Args:
-        results: dict returned by train_handcrafted_baseline
-        feature_names: list of feature name strings
-    """
+def print_cnn_results(results):
+    """Print CNN results."""
     print("\n" + "=" * 70)
-    print("HANDCRAFTED BASELINE RESULTS")
+    print("CNN RESULTS — Patient-Level 5-Fold CV (v4 with oversampling)")
     print("=" * 70)
 
-    # Per-fold results
     print(f"\n--- Per-Fold Results ---")
-    print(f"{'Fold':<6} {'Accuracy':<12} {'Precision':<12} {'Recall':<12} {'F1':<12} {'Train':<8} {'Test':<8}")
-    print("-" * 70)
+    print(f"{'Fold':<6} {'Accuracy':<12} {'Precision':<12} {'Recall':<12} {'F1':<12}")
+    print("-" * 60)
     for m in results["fold_metrics"]:
         print(f"{m['fold']:<6} {m['accuracy']:<12.4f} {m['precision']:<12.4f} "
-              f"{m['recall']:<12.4f} {m['f1']:<12.4f} {m['n_train']:<8} {m['n_test']:<8}")
+              f"{m['recall']:<12.4f} {m['f1']:<12.4f}")
 
-    # Summary stats
     print(f"\n--- Summary ---")
-    print(f"Mean accuracy across folds: {results['mean_accuracy']:.4f} ± {results['std_accuracy']:.4f}")
-    print(f"Pooled OOF accuracy:        {results['pooled_accuracy']:.4f}")
-    print(f"Pooled precision:           {results['pooled_precision']:.4f}")
-    print(f"Pooled recall:              {results['pooled_recall']:.4f}  (critical for screening)")
-    print(f"Pooled F1:                  {results['pooled_f1']:.4f}")
+    print(f"Mean accuracy:  {results['mean_accuracy']:.4f} ± {results['std_accuracy']:.4f}")
+    print(f"Pooled OOF acc: {results['pooled_accuracy']:.4f}")
+    print(f"Pooled recall:  {results['pooled_recall']:.4f}")
+    print(f"Pooled F1:      {results['pooled_f1']:.4f}")
 
-    # Pooled confusion matrix
     cm = results["pooled_confusion_matrix"]
-    print(f"\n--- Pooled Confusion Matrix ---")
-    print(f"                  Predicted Healthy  Predicted PD")
-    print(f"  Actual Healthy      {cm[0,0]:>5} (TN)        {cm[0,1]:>5} (FP)")
-    print(f"  Actual PD           {cm[1,0]:>5} (FN)        {cm[1,1]:>5} (TP)")
-    print(f"\n  False negatives (missed PD cases): {cm[1,0]}")
-    print(f"  False positives (false alarms):    {cm[0,1]}")
-
-    # Interpretation
-    print(f"\n--- Interpretation ---")
-    pooled_acc = results["pooled_accuracy"]
-    if pooled_acc >= 0.80:
-        print(f"  ✅ {pooled_acc:.1%} — strong baseline.")
-    elif pooled_acc >= 0.70:
-        print(f"  ✅ {pooled_acc:.1%} — solid baseline in expected range (70-80%).")
-    elif pooled_acc >= 0.60:
-        print(f"  ⚠️  {pooled_acc:.1%} — below expected. Features may need improvement.")
-    else:
-        print(f"  ❌ {pooled_acc:.1%} — near random. Check feature extraction.")
-
-    print(f"\n  Recall = {results['pooled_recall']:.1%} (of all actual PD cases, how many we caught)")
-    if results["pooled_recall"] < 0.70:
-        print(f"  ⚠️  Low recall — model is missing many PD cases (false negatives).")
-    else:
-        print(f"  ✅ Recall is acceptable for a screening aid.")
+    print(f"\n--- Confusion Matrix ---")
+    print(f"                  Pred Healthy  Predicted PD")
+    print(f"  Actual Healthy    {cm[0,0]:>5} (TN)        {cm[0,1]:>5} (FP)")
+    print(f"  Actual PD         {cm[1,0]:>5} (FN)        {cm[1,1]:>5} (TP)")
+    print(f"\n  Missed PD (FN): {cm[1,0]}")
+    print(f"  False alarms (FP): {cm[0,1]}")
 
 
-# ---------------------------------------------------------------------------
-# Step 5: Save OOF predictions for later McNemar test
-# ---------------------------------------------------------------------------
-
-def save_predictions(results):
-    """Save OOF predictions for later comparison with CNN via McNemar test.
-
-    We save:
-        - oof_predictions_handcrafted.npy: binary predictions (0 or 1)
-        - oof_probabilities_handcrafted.npy: probability scores (0.0 to 1.0)
-
-    These will be compared against the CNN's OOF predictions in Week 2/3.
-    """
+def save_cnn_predictions(results):
+    """Save CNN OOF predictions for McNemar test."""
     os.makedirs("data/processed", exist_ok=True)
-    np.save("data/processed/oof_predictions_handcrafted.npy", results["oof_predictions"])
-    np.save("data/processed/oof_probabilities_handcrafted.npy", results["oof_probabilities"])
-    print(f"\n  Saved OOF predictions to data/processed/oof_predictions_handcrafted.npy")
-    print(f"  Saved OOF probabilities to data/processed/oof_probabilities_handcrafted.npy")
+    np.save("data/processed/oof_predictions_cnn.npy", results["oof_predictions"])
+    np.save("data/processed/oof_probabilities_cnn.npy", results["oof_probabilities"])
+    print(f"  Saved to data/processed/oof_predictions_cnn.npy")
+    print(f"  Saved to data/processed/oof_probabilities_cnn.npy")
 
 
-# ---------------------------------------------------------------------------
-# Step 6: Feature importance (which features matter most?)
-# ---------------------------------------------------------------------------
-
-def analyze_feature_importance(features, labels, patient_ids, feature_names):
-    """Train logistic regression on ALL data to get feature coefficients.
-
-    NOTE: This is for interpretation only, NOT for evaluation.
-    The evaluation uses patient-level CV (above). Here we train on all data
-    to get an overall sense of which features matter.
-
-    Args:
-        features, labels, patient_ids: full dataset
-        feature_names: list of feature names
-    """
-    print(f"\n--- Feature Importance (trained on all data, for interpretation) ---")
-
-    # Standardize
-    scaler = StandardScaler()
-    features_scaled = scaler.fit_transform(features)
-
-    # Train on all data (NOT for evaluation — just for coefficient inspection)
-    model = LogisticRegression(class_weight="balanced", max_iter=1000, random_state=42)
-    model.fit(features_scaled, labels)
-
-    # Get coefficients (after standardization, so they're comparable)
-    coefs = model.coef_[0]
-
-    print(f"  {'Feature':<35} {'Coefficient':<15} {'|Effect|'}")
-    print(f"  " + "-" * 65)
-    for name, coef in sorted(zip(feature_names, coefs), key=lambda x: abs(x[1]), reverse=True):
-        direction = "↑ PD" if coef > 0 else "↓ PD"
-        print(f"  {name:<35} {coef:>+10.4f}      {direction}")
-
-    print(f"\n  Interpretation:")
-    print(f"  - Positive coefficient = higher feature value → more likely PD")
-    print(f"  - Negative coefficient = higher feature value → less likely PD")
-    print(f"  - Magnitude (after standardization) = how important the feature is")
-
-
-# ---------------------------------------------------------------------------
-# Main execution block
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# MAIN
+# ===========================================================================
 
 if __name__ == "__main__":
-    print("=" * 70)
-    print("Handcrafted Features Baseline — Patient-Level 5-Fold CV")
-    print("=" * 70)
+    import argparse
 
-    # Step 1: Load the dataset (for labels and patient_ids)
-    print("\n1. Loading dataset...")
+    parser = argparse.ArgumentParser(description="Train models for Parkinson's spiral screening")
+    parser.add_argument("--model", choices=["baseline", "cnn", "both"], default="both",
+                        help="Which model to train")
+    parser.add_argument("--epochs", type=int, default=60, help="CNN epochs (default 60)")
+    parser.add_argument("--batch-size", type=int, default=16, help="Batch size (default 16)")
+    args = parser.parse_args()
+
+    print("=" * 70)
+    print("Loading dataset...")
+    print("=" * 70)
     images, labels, patient_ids, filenames = load_newhandpd("data/raw/Merged")
 
-    # Step 2: Load the handcrafted features
-    print("\n2. Loading handcrafted features...")
-    features, feature_names = load_features()
+    # --- Baseline ---
+    if args.model in ["baseline", "both"]:
+        print("\n" + "=" * 70)
+        print("HANDCRAFTED BASELINE — Patient-Level 5-Fold CV")
+        print("=" * 70)
 
-    # Sanity check: features and labels must have same length
-    assert len(features) == len(labels), \
-        f"Mismatch: {len(features)} features vs {len(labels)} labels"
+        features, feature_names = load_features()
+        assert len(features) == len(labels)
 
-    # Step 3: Train with patient-level 5-fold CV
-    print("\n3. Training logistic regression baseline...")
-    results = train_handcrafted_baseline(features, labels, patient_ids, n_splits=5)
+        baseline_results = train_handcrafted_baseline(features, labels, patient_ids, n_splits=5)
+        print_results(baseline_results, feature_names)
+        save_predictions(baseline_results)
+        analyze_feature_importance(features, labels, patient_ids, feature_names)
 
-    # Step 4: Print results
-    print_results(results, feature_names)
+        print(f"\nBaseline accuracy: {baseline_results['pooled_accuracy']:.1%}")
 
-    # Step 5: Save OOF predictions for McNemar test
-    print("\n4. Saving OOF predictions for later McNemar test...")
-    save_predictions(results)
+    # --- CNN ---
+    if args.model in ["cnn", "both"]:
+        print("\n" + "=" * 70)
+        print("CNN TRAINING (v4) — Patient-Level 5-Fold CV with Oversampling")
+        print("=" * 70)
 
-    # Step 6: Feature importance analysis
-    print("\n5. Feature importance analysis...")
-    analyze_feature_importance(features, labels, patient_ids, feature_names)
+        print(f"\nEpochs: {args.epochs}, Batch size: {args.batch_size}")
+        print("Oversampling: healthy class duplicated to match PD count")
+        print("Architecture: Conv(32)-Conv(64)-Conv(128)-GAP-Dense(64)-Sigmoid")
+        print("No BatchNorm, no L2, no augmentation (v4 working version)")
+
+        cnn_results = train_cnn_with_cv(
+            images, labels, patient_ids,
+            n_splits=5, epochs=args.epochs, batch_size=args.batch_size,
+        )
+
+        print_cnn_results(cnn_results)
+        save_cnn_predictions(cnn_results)
+
+        print(f"\nCNN accuracy: {cnn_results['pooled_accuracy']:.1%}")
+
+    # --- Summary ---
+    if args.model == "both":
+        print("\n" + "=" * 70)
+        print("SUMMARY — Baseline vs CNN")
+        print("=" * 70)
+        print(f"  Handcrafted baseline: {baseline_results['pooled_accuracy']:.1%} "
+              f"(recall {baseline_results['pooled_recall']:.1%})")
+        print(f"  CNN:                  {cnn_results['pooled_accuracy']:.1%} "
+              f"(recall {cnn_results['pooled_recall']:.1%})")
+        diff = cnn_results["pooled_accuracy"] - baseline_results["pooled_accuracy"]
+        print(f"  Difference:           {diff:+.1%}")
+        print(f"\nNext: Run McNemar test (src/evaluate.py) to check significance.")
 
     print("\n" + "=" * 70)
-    print("BASELINE TRAINING COMPLETE")
+    print("TRAINING COMPLETE")
     print("=" * 70)
-    print(f"\nFirst honest accuracy number: {results['pooled_accuracy']:.1%}")
-    print(f"  (mean across folds: {results['mean_accuracy']:.1%} ± {results['std_accuracy']:.1%})")
