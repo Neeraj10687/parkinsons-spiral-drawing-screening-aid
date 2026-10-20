@@ -1,0 +1,15 @@
+Grad-CAM Stroke-Region Correlation - Model: spiral_cnn_v4
+Dataset: 632 images
+
+Mean stroke attention ratio: 0.8924
+Mean in-stroke activation:   0.3912
+Mean background activation:  0.0451
+Mean stroke fraction:        0.1595
+
+Feature                        Pearson r    p-value      Sig  
+------------------------------------------------------------
+radius_deviation               -0.1498      0.0002      ***
+stroke_smoothness              +0.1008      0.0112      *
+stroke_entropy                 +0.4230      0.0000      ***
+intersection_count             +0.1159      0.0035      **
+mean_squared_displacement      +0.1576      0.0001      ***
