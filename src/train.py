@@ -45,8 +45,8 @@ from src.data_loader import (
     load_newhandpd,
     patient_level_split,
     verify_no_patient_overlap,
-    load_features,
 )
+from src.features import extract_features_for_dataset
 
 
 # ===========================================================================
@@ -71,6 +71,7 @@ def train_handcrafted_baseline(features, labels, patient_ids, n_splits=5):
                                  n_splits=n_splits, random_state=42)
 
     oof_predictions = np.zeros(len(labels), dtype=int)
+    oof_probabilities = np.zeros(len(labels), dtype=float)
     oof_test_mask = np.zeros(len(labels), dtype=bool)
     fold_metrics = []
 
@@ -88,6 +89,7 @@ def train_handcrafted_baseline(features, labels, patient_ids, n_splits=5):
         model.fit(X_train_scaled, y_train)
 
         predictions = model.predict(X_test_scaled)
+        probabilities = model.predict_proba(X_test_scaled)[:, 1]  # P(PD)
         accuracy = accuracy_score(y_test, predictions)
         precision = precision_score(y_test, predictions, zero_division=0)
         recall = recall_score(y_test, predictions, zero_division=0)
@@ -98,6 +100,7 @@ def train_handcrafted_baseline(features, labels, patient_ids, n_splits=5):
               f"rec={recall:.4f}, f1={f1:.4f}")
 
         oof_predictions[test_idx] = predictions
+        oof_probabilities[test_idx] = probabilities
         oof_test_mask[test_idx] = True
         fold_metrics.append({
             "fold": fold_idx + 1, "accuracy": accuracy, "precision": precision,
@@ -118,6 +121,7 @@ def train_handcrafted_baseline(features, labels, patient_ids, n_splits=5):
 
     return {
         "oof_predictions": oof_predictions,
+        "oof_probabilities": oof_probabilities,
         "fold_metrics": fold_metrics,
         "mean_accuracy": mean_acc,
         "std_accuracy": std_acc,
@@ -150,10 +154,21 @@ def print_results(results, feature_names):
 
 
 def save_predictions(results):
-    """Save OOF predictions for McNemar test."""
+    """Save OOF predictions + probabilities for McNemar test and ensemble.
+
+    Saves under both the legacy 'handcrafted' name and the 'lr' name that
+    evaluate.py expects, so either version of evaluate.py finds the files.
+    Probabilities (P(PD)) are needed for the 3-way ensemble averaging.
+    """
     os.makedirs("data/processed", exist_ok=True)
+    # Legacy names (backward compat with old docs)
     np.save("data/processed/oof_predictions_handcrafted.npy", results["oof_predictions"])
-    print(f"  Saved to data/processed/oof_predictions_handcrafted.npy")
+    # New names that evaluate.py looks for
+    np.save("data/processed/oof_predictions_lr.npy", results["oof_predictions"])
+    np.save("data/processed/oof_probabilities_lr.npy", results["oof_probabilities"])
+    print(f"  Saved to data/processed/oof_predictions_lr.npy")
+    print(f"  Saved to data/processed/oof_probabilities_lr.npy")
+    print(f"  Saved to data/processed/oof_predictions_handcrafted.npy (legacy)")
 
 
 def analyze_feature_importance(features, labels, patient_ids, feature_names):
@@ -662,7 +677,22 @@ if __name__ == "__main__":
         print("HANDCRAFTED BASELINE - Patient-Level 5-Fold CV")
         print("=" * 70)
 
-        features, feature_names = load_features()
+        # Extract the 5 handcrafted features from images (slow first run,
+        # cached as .npy on subsequent runs).
+        import os as _os
+        feat_cache = "data/processed/features_handcrafted.npy"
+        names_cache = "data/processed/feature_names.npy"
+        if _os.path.exists(feat_cache) and _os.path.exists(names_cache):
+            print("  Loading cached features...")
+            features = np.load(feat_cache)
+            feature_names = np.load(names_cache, allow_pickle=True).tolist()
+        else:
+            print("  Extracting handcrafted features (first run, slow)...")
+            features, feature_names = extract_features_for_dataset(images)
+            _os.makedirs("data/processed", exist_ok=True)
+            np.save(feat_cache, features)
+            np.save(names_cache, np.array(feature_names, dtype=object))
+            print(f"  Cached to {feat_cache}")
         assert len(features) == len(labels)
 
         baseline_results = train_handcrafted_baseline(features, labels, patient_ids, n_splits=5)
